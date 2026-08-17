@@ -366,10 +366,17 @@ def main(argv=None):
         if not code:
             raise LoginError("等待验证码输入超时")
         account.submit_verification_code(context, flag, code)
-        # 已验证会话重新登录, 应跳过安全验证直接完成 (绕开 end 的 _signature)
+        # 三级尝试: ① 验证会话直接取 token → ② 同会话重新登录 → ③ 回退授权
+        try:
+            save_token()
+            if webui:
+                webui.update(login_step="done", masked_phone=None)
+            return
+        except LoginError:
+            logger.info("验证会话直接取 token 未成功, 尝试重新登录")
         result = account.login()
         if result["status"] != "ok":
-            raise LoginError("验证通过后重新登录仍被要求安全验证")
+            raise LoginError("验证通过后仍无法完成登录, 请稍后在 WebUI 使用授权链接")
         save_token()
         if webui:
             webui.update(login_step="done", masked_phone=None)
