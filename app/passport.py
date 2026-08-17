@@ -202,6 +202,8 @@ class XiaomiAccount:
             "&trust=false&_json=true"
         ).encode("utf-8")
         resp = self._passport_json(f"{self.base_url}/identity/auth/verifyPhone", body)
+        # 调试: 记录完整响应 (用于逆向 identityToken 来源)
+        logger.debug("verifyPhone 响应: %s", json.dumps(resp, ensure_ascii=False)[:600])
         if resp.get("code") != 0:
             raise LoginError(
                 f"验证码校验失败: {json.dumps(resp, ensure_ascii=False)}"
