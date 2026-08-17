@@ -385,7 +385,13 @@ def main(argv=None):
         await_authorization(client, store, authorize_file, stop, webui)
 
     if webui:
-        threading.Thread(target=webui.run, name="webui", daemon=True).start()
+        def _webui_runner():
+            try:
+                webui.run()
+            except Exception as exc:
+                logger.error("WebUI 启动失败 (端口 %s 可能被占用): %s", webui.port, exc)
+
+        threading.Thread(target=_webui_runner, name="webui", daemon=True).start()
         logger.info("WebUI 已启动: http://localhost:%d", webui.port)
         if webui.token:
             logger.info("WebUI 访问需携带 token 参数: http://localhost:%d/?token=%s", webui.port, webui.token)
@@ -442,6 +448,10 @@ def main(argv=None):
                 break
             if webui and webui.login_requested.is_set():
                 webui.login_requested.clear()
+                if not account:
+                    logger.warning("收到登录请求但未配置 MIWIFI_XIAOMI_USER/PASS")
+                    webui.update(login_step="error", login_error="未配置账号凭据, 无法登录")
+                    break
                 try:
                     account_login()
                 except LoginError as exc:
