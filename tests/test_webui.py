@@ -67,6 +67,30 @@ class WebUITest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(self.webui.sync_requested.is_set())
 
+    def test_login_triggers_event(self):
+        self.webui.login_requested.clear()
+        status, _ = self._post("/api/login", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(self.webui.login_requested.is_set())
+
+    def test_verify_submits_code(self):
+        status, data = self._post("/api/verify", {"code": "123456"})
+        self.assertEqual(status, 200)
+        self.assertTrue(data.get("ok"))
+        self.assertEqual(self.webui.poll_verify_code(), "123456")
+
+    def test_verify_rejects_empty(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post("/api/verify", {"code": ""})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_login_state_roundtrip(self):
+        self.webui.update(account_login=True, login_step="verify_required", masked_phone="+86 199****41")
+        snap = self.webui.snapshot()
+        self.assertTrue(snap["account_login"])
+        self.assertEqual(snap["login_step"], "verify_required")
+        self.assertEqual(snap["masked_phone"], "+86 199****41")
+
     def test_unknown_route_404(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._get("/api/nope")

@@ -53,6 +53,16 @@ a{color:#1565c0;word-break:break-all}
 <textarea id="code"></textarea>
 <button id="submit">提交授权</button>
 <div id="msg"></div></div>
+<div class="card" id="logincard" style="display:none">
+<div class="kv"><span class="label">账号登录</span><span id="loginstate" class="badge warn">未开始</span></div>
+<p>程序自动完成登录流程, 仅在需要短信验证码时要求你输入</p>
+<button id="loginbtn">开始登录</button>
+<div id="verifypanel" style="display:none;margin-top:10px">
+<p id="verifyhint">验证码已发送, 请输入:</p>
+<input type="text" id="verifycode" placeholder="6 位验证码">
+<button id="verifybtn">提交验证码</button>
+</div>
+<div id="loginmsg"></div></div>
 <div class="card"><button id="syncbtn">立即同步一次</button><div id="syncmsg"></div></div>
 <script>
 const params=new URLSearchParams(location.search);
@@ -70,7 +80,17 @@ document.getElementById('entries').textContent=(s.managed_entries!=null? s.manag
 if(s.auth_required){
 document.getElementById('authcard').style.display='block';
 document.getElementById('authurl').href=s.auth_url||'#';document.getElementById('authurl').textContent=s.auth_url||'';
-}else{document.getElementById('authcard').style.display='none';}}
+}else{document.getElementById('authcard').style.display='none';}
+const lc=document.getElementById('logincard');
+if(s.account_login){lc.style.display='block';}else{lc.style.display='none';return;}
+const ls=document.getElementById('loginstate');
+const steps={idle:['未开始','warn'],working:['登录中…','warn'],verify_required:['等待验证码','bad'],error:['失败','bad'],done:['已完成','ok']};
+const st=steps[s.login_step]||steps.idle;
+ls.textContent=st[0];ls.className='badge '+st[1];
+document.getElementById('verifypanel').style.display=s.login_step==='verify_required'?'block':'none';
+if(s.masked_phone)document.getElementById('verifyhint').textContent='验证码已发送至 '+s.masked_phone+', 请输入:';
+const lm=document.getElementById('loginmsg');
+if(s.login_error){lm.textContent=s.login_error;lm.className='msg err';}else{lm.textContent='';}}
 function refresh(){api('/api/status').then(render).catch(()=>{});}
 document.getElementById('submit').onclick=()=>{
 const c=document.getElementById('code').value.trim();
@@ -84,6 +104,16 @@ document.getElementById('submit').disabled=false;refresh();});};
 document.getElementById('syncbtn').onclick=()=>{
 api('/api/sync',{method:'POST'}).then(r=>{const m=document.getElementById('syncmsg');
 m.textContent=r.error||'已触发同步';m.className='msg '+(r.error?'err':'ok');});};
+document.getElementById('loginbtn').onclick=()=>{
+api('/api/login',{method:'POST'}).then(r=>{const m=document.getElementById('loginmsg');
+m.textContent=r.error||'登录已开始, 等待手机验证码…';m.className='msg '+(r.error?'err':'ok');});};
+document.getElementById('verifybtn').onclick=()=>{
+const c=document.getElementById('verifycode').value.trim();
+if(!c){document.getElementById('loginmsg').textContent='请输入验证码';document.getElementById('loginmsg').className='msg err';return;}
+api('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:c})})
+.then(r=>{const m=document.getElementById('loginmsg');
+m.textContent=r.error||'验证码已提交';m.className='msg '+(r.error?'err':'ok');
+if(!r.error)document.getElementById('verifycode').value='';});};
 refresh();setInterval(refresh,5000);
 </script></body></html>"""
 
@@ -95,7 +125,9 @@ class WebUI:
         self.port = port
         self.token = token or ""
         self.auth_codes = queue.Queue()
+        self.verify_codes = queue.Queue()
         self.sync_requested = threading.Event()
+        self.login_requested = threading.Event()
         self._lock = threading.Lock()
         self._state = {
             "auth_required": False,
@@ -108,6 +140,10 @@ class WebUI:
             "last_result": None,
             "managed_entries": None,
             "manual_entries": None,
+            "account_login": False,
+            "login_step": "idle",  # idle | working | verify_required | error | done
+            "masked_phone": None,
+            "login_error": None,
         }
         self._server = None
         self._ready = threading.Event()
@@ -147,6 +183,20 @@ class WebUI:
             return "内容为空"
         self.auth_codes.put(url.strip())
         return None
+
+    def submit_verify_code(self, code):
+        """WebUI 提交登录验证码; 返回错误信息或 None。"""
+        if not (code or "").strip():
+            return "内容为空"
+        self.verify_codes.put(code.strip())
+        return None
+
+    def poll_verify_code(self):
+        """非阻塞获取用户提交的验证码。"""
+        try:
+            return self.verify_codes.get_nowait()
+        except queue.Empty:
+            return None
 
     def poll_code(self):
         """非阻塞获取用户提交的授权内容。"""
@@ -228,5 +278,20 @@ class _Handler(BaseHTTPRequestHandler):
         elif route == "/api/sync":
             self.webui.sync_requested.set()
             self._send_json({"ok": True})
+        elif route == "/api/login":
+            self.webui.login_requested.set()
+            self._send_json({"ok": True})
+        elif route == "/api/verify":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                data = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            except ValueError:
+                self._send_json({"error": "无效的 JSON"}, 400)
+                return
+            error = self.webui.submit_verify_code(data.get("code", ""))
+            if error:
+                self._send_json({"error": error}, 400)
+            else:
+                self._send_json({"ok": True})
         else:
             self._send_json({"error": "not found"}, 404)

@@ -1,18 +1,13 @@
 """同步入口: 拉取 GitHub-IP-hosts 数据并写入小米路由器自定义 Hosts。
 
 云端容器中常驻运行, 每次启动立即同步一次, 之后按 SYNC_INTERVAL_SECONDS
-周期性执行。内置 WebUI (WEBUI_PORT, 默认 8080) 展示状态并在需要授权时
-提供交互式授权流程。
+周期性执行。内置 WebUI (WEBUI_PORT, 默认 8080) 展示状态并提供交互:
+- 配置账号密码时, 登录流程完全由程序自动执行, 仅在触发设备安全验证
+  时通过 WebUI 要求用户输入短信验证码
+- 无账号配置时, token 失效走授权链接模式 (浏览器授权后粘贴回跳 URL)
 
-token 管理 (持久部署), 按优先级:
-1. 缓存文件 TOKEN_CACHE_FILE (默认 /data/token.json)
-2. 环境变量 MIWIFI_TOKEN
-3. 账号自动刷新: 配置 MIWIFI_XIAOMI_USER / MIWIFI_XIAOMI_PASS 时,
-   通过 passport 登录 + OAuth 授权码自动换取新 token (仅限已信任设备;
-   新设备触发安全验证时此路径会失败并转入授权模式)
-4. 交互授权: 程序输出授权 URL, 用户浏览器打开登录小米账号完成授权
-   (新设备首次需短信验证码), 把回跳 URL 提交到 WebUI 或写入
-   AUTHORIZE_FILE, 程序自动换取并缓存 token。90 天到期后重复该操作
+token 生命周期: 授权后有效期约 90 天, 缓存于 TOKEN_CACHE_FILE
+(默认 /data/token.json, 已挂载卷)。失效/到期时自动触发上述流程。
 """
 
 import argparse
@@ -46,6 +41,8 @@ DEFAULT_AUTHORIZE_FILE = "/data/authorize.url"
 TOKEN_LIFETIME = 90 * 24 * 3600
 # 提前 30 天主动刷新
 DEFAULT_REFRESH_INTERVAL = 60 * 24 * 3600
+# 等待验证码输入超时 (秒)
+VERIFY_TIMEOUT = 15 * 60
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -118,15 +115,11 @@ class TokenStore:
 
 
 def build_redirect_uri(device_id):
-    """构造与真实页面一致的 OAuth 回调地址。
-
-    必须保持确定性: get_acc_token 会校验 redirect_uri 与授权时一致,
-    因此不能包含每次变化的时间戳等参数。
-    """
+    """构造与真实页面一致的 OAuth 回调地址 (必须保持确定性)。"""
     gateway = _env("MIWIFI_GATEWAY_IP", "192.168.1.1")
     model = _env("MIWIFI_MODEL", "xiaomi.router.rd15")
     return (
-        "http://s.miwifi.com/dist/userhosts/index.html"
+        "https://s.miwifi.com/dist/userhosts/index.html"
         f"?gatewayIp={gateway}&language=zh&model={model}&deviceID={device_id}"
     )
 
@@ -145,7 +138,6 @@ def parse_authorize_input(text):
     """从用户提交的授权回跳内容中解析 (kind, value)。
 
     kind 为 "code" (需向 gorouter 换取 token) 或 "token" (直接可用)。
-    支持完整 URL (query 中 code / fragment 中 access_token) 或裸值。
     """
     text = (text or "").strip()
     if not text:
@@ -170,17 +162,6 @@ def make_client(token, scope):
         base_url=_env("GOROUTER_BASE_URL", DEFAULT_BASE_URL),
         timeout=int(_env("HTTP_TIMEOUT", "30")),
     )
-
-
-def refresh_token(account, client, store):
-    """账号自动刷新: passport 登录 -> OAuth 授权码 -> 换 token。"""
-    redirect_uri = build_redirect_uri(client.device_id)
-    token, scope = account.refresh_token(client.app_id, redirect_uri)
-    client.token = token
-    client.scope = scope or client.scope
-    store.save(token, client.scope)
-    logger.info("access_token 已通过账号自动刷新")
-    return token
 
 
 def apply_authorization(client, store, parsed):
@@ -327,6 +308,8 @@ def main(argv=None):
         webui.update(sync_interval=f"{int(_env('SYNC_INTERVAL_SECONDS', '21600'))} 秒")
 
     account = XiaomiAccount(user, password) if user and password else None
+    if webui:
+        webui.update(account_login=bool(account))
     cached = store.load()
 
     stop = {"flag": False}
@@ -338,19 +321,67 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    # token 来源优先级: 缓存 > 环境变量 > 账号刷新 > 交互授权
+    # token 来源优先级: 缓存 > 环境变量 > 账号登录 > 交互授权
     token = cached["token"] if cached else static_token
     scope = (cached or {}).get("scope")
     client = make_client(token or "", scope)
 
+    def save_token():
+        """用已登录会话直取 access_token 并缓存。"""
+        new_token, new_scope = account.get_access_token(
+            client.app_id, build_redirect_uri(client.device_id)
+        )
+        client.token = new_token
+        client.scope = new_scope or client.scope
+        store.save(new_token, client.scope)
+        logger.info("access_token 已通过账号自动获取")
+
+    def account_login():
+        """账号自动登录; 触发安全验证时通过 WebUI 输入验证码。"""
+        if webui:
+            webui.update(login_step="working", login_error=None)
+        logger.info("开始账号登录")
+        result = account.login()
+        if result["status"] == "ok":
+            save_token()
+            if webui:
+                webui.update(login_step="done")
+            return
+
+        context = result["context"]
+        flag, masked = account.send_verification_code(context)
+        if webui:
+            webui.update(login_step="verify_required", masked_phone=masked)
+            logger.warning("验证码已发送至 %s, 请在 WebUI 输入", masked or "安全手机")
+        else:
+            logger.warning("验证码已发送至 %s, 无 WebUI 无法交互, 超时后转授权模式", masked or "安全手机")
+        deadline = time.time() + VERIFY_TIMEOUT
+        code = None
+        while time.time() < deadline and not stop["flag"]:
+            if webui:
+                code = webui.poll_verify_code()
+            if code:
+                break
+            time.sleep(1)
+        if not code:
+            raise LoginError("等待验证码输入超时")
+        account.submit_verification_code(context, flag, code)
+        # 已验证会话重新登录, 应跳过安全验证直接完成 (绕开 end 的 _signature)
+        result = account.login()
+        if result["status"] != "ok":
+            raise LoginError("验证通过后重新登录仍被要求安全验证")
+        save_token()
+        if webui:
+            webui.update(login_step="done", masked_phone=None)
+
     def obtain():
-        """重新获取 token: 优先账号刷新, 否则交互授权。"""
+        """重新获取 token: 账号自动登录 (含验证码交互) 或交互授权。"""
         if account:
             try:
-                refresh_token(account, client, store)
+                account_login()
                 return
             except LoginError as exc:
-                logger.error("账号自动登录失败: %s, 转入交互授权", exc)
+                logger.error("账号自动登录失败: %s, 转入授权链接模式", exc)
         await_authorization(client, store, authorize_file, stop, webui)
 
     if webui:
@@ -386,13 +417,13 @@ def main(argv=None):
             if account:
                 cached_now = store.load()
                 if cached_now and int(time.time()) - int(cached_now.get("issued_at", 0)) >= refresh_interval:
-                    refresh_token(account, client, store)
+                    account_login()
             result = run_sync_with_refresh(client, urls, timeout, obtain)
             report_sync(result)
         except LoginError as exc:
             logger.error("账号自动登录失败: %s", exc)
             if webui:
-                webui.update(token_ok=False, last_result=f"同步失败: {exc}")
+                webui.update(login_step="error", login_error=str(exc))
         except Exception as exc:
             logger.error("同步失败: %s", exc)
             if webui:
@@ -403,11 +434,20 @@ def main(argv=None):
             break
         elapsed = time.monotonic() - started
         remaining = max(interval - elapsed, 0)
-        # 响应 WebUI 手动同步请求, 分片睡眠
+        # 响应 WebUI 手动同步/登录请求, 分片睡眠
         slept = 0
         while slept < remaining and not stop["flag"]:
             if webui and webui.sync_requested.is_set():
                 webui.sync_requested.clear()
+                break
+            if webui and webui.login_requested.is_set():
+                webui.login_requested.clear()
+                try:
+                    account_login()
+                except LoginError as exc:
+                    logger.error("账号登录失败: %s", exc)
+                    if webui:
+                        webui.update(login_step="error", login_error=str(exc))
                 break
             time.sleep(1)
             slept += 1
