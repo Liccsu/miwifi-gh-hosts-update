@@ -1,0 +1,8 @@
+services:
+  miwifi-gh-hosts-update:
+    image: ghcr.io/liccsu/miwifi-gh-hosts-update:latest
+    container_name: miwifi-gh-hosts-update
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai
