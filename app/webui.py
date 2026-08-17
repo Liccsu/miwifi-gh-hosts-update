@@ -181,7 +181,7 @@ if(s.auth_error){am.textContent='✕ '+s.auth_error;am.className='err';}else{am.
 function refresh(){api('/api/status').then(render).catch(()=>{});}
 
 document.getElementById('loginbtn').onclick=()=>{
-if(curTokenOk&&!confirm('access_token 仍有效。确认要现在刷新吗?\n将发送验证码短信到你的手机, 刷新后旧 token 立即作废。'))return;
+if(curTokenOk&&!confirm('access_token 仍有效。确认要现在刷新吗? 将发送验证码短信到你的手机, 刷新后旧 token 立即作废。'))return;
 api('/api/login',{method:'POST'}).then(r=>{
 if(r.error){toast(r.error,'err');}
 else{toast('已开始登录, 请留意手机验证码','ok');refresh();}});};
