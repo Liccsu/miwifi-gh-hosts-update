@@ -27,27 +27,38 @@
 
 ## 获取与更新 token
 
-### 方式一（推荐）：账号密码自动刷新
+### 方式一（推荐）：WebUI 交互授权
 
-在 `.env` 中配置 `MIWIFI_XIAOMI_USER`（小米账号）与 `MIWIFI_XIAOMI_PASS`（密码），
-程序启动时自动执行 passport 登录 -> OAuth 授权 -> 换取 `access_token`，
-并将新 token 缓存到 `TOKEN_CACHE_FILE`（默认 `/data/token.json`，已挂载卷）。
+token 缺失或失效时，程序输出授权链接并进入等待状态，WebUI（默认
+`http://<服务器>:8080`）页面会显示"需要授权"面板：
 
-token 有效期约 90 天，程序在 60 天（`TOKEN_REFRESH_INTERVAL` 可调）时提前主动刷新，
-失效（HTTP 401 / code 3001）时即时刷新并重试同步，全程无需人工干预。
+1. 点击页面上的授权链接，浏览器打开小米账号登录页
+2. 登录小米账号并授权（新设备首次需短信验证码确认，属安全流程）
+3. 授权后浏览器跳转到 s.miwifi.com，复制地址栏完整 URL
+4. 粘贴到 WebUI 输入框提交
 
-> 风险说明：
-> - 账号开启二次验证或触发风控时，小米会要求验证码，自动登录将失败，
->   程序输出 ERROR 日志并停止刷新，此时需改用方式二或临时手动处理
-> - 自动登录可能触发小米的异常登录提醒，属正常现象
-> - 账号凭据仅保存在 `.env` 中，请勿提交到 git、注意容器所在主机的访问权限
+程序自动换取并缓存新 token（`TOKEN_CACHE_FILE`，已挂载卷）。token 有效期
+约 90 天，到期后重复上述操作，全程无需 SSH 进服务器改文件。
 
-### 方式二：手动 token
+> 若不想用 WebUI：授权后把回跳 URL 写入宿主机挂载目录
+> `./data/authorize.url` 同样有效。
 
-1. 浏览器打开自定义 Hosts 页面（`http://s.miwifi.com/dist/userhosts/index.html`，`gatewayIp` 改为路由器网关 IP），登录小米账号授权
-2. 地址栏 URL 中 `#access_token=...` 后面的值即 `MIWIFI_TOKEN`，`deviceID=...` 即 `MIWIFI_DEVICE_ID`
-3. token 有效期约 90 天（URL 中 `expires_in=7776000` 秒）。过期后程序会持续输出
-   `access_token 已失效` 错误日志，此时重复步骤 1 获取新 token，更新 `.env` 后重启容器即可
+### 方式二：账号自动刷新（仅限已信任设备）
+
+在 `.env` 中配置 `MIWIFI_XIAOMI_USER` 与 `MIWIFI_XIAOMI_PASS`，程序启动时
+自动执行 passport 登录 -> OAuth 授权 -> 换取 `access_token` 并缓存，
+60 天（`TOKEN_REFRESH_INTERVAL`）主动刷新、失效即时刷新。
+
+> 限制：小米对新设备/异地环境登录强制安全验证（安全手机短信验证码），
+> 纯 API 无法完成，此时自动刷新会失败并自动转入方式一的 WebUI 授权。
+> 在已信任设备/网络（如家庭 NAS）上运行可全自动。
+
+### 方式三：手动 token
+
+浏览器打开自定义 Hosts 页面（`http://s.miwifi.com/dist/userhosts/index.html`，
+`gatewayIp` 改为路由器网关 IP），登录授权后，地址栏 `#access_token=...`
+即 `MIWIFI_TOKEN`，`deviceID=...` 即 `MIWIFI_DEVICE_ID`。token 约 90 天
+过期，程序会输出失效日志并转入 WebUI 授权流程。
 
 ## 部署
 
@@ -70,6 +81,12 @@ docker compose up -d
 docker compose logs -f
 ```
 
+### 3. 访问 WebUI
+
+浏览器打开 `http://<服务器IP>:8080`，可查看同步状态与 token 有效期；
+token 失效需要授权时页面会显示授权入口（见下文"获取与更新 token"）。
+
+
 ### 环境变量
 
 | 变量 | 必填 | 默认值 | 说明 |
@@ -82,6 +99,10 @@ docker compose logs -f
 | `MIWIFI_SCOPE` | 否 | `1+1000+3` | 授权 scope（页面固定值） |
 | `TOKEN_REFRESH_INTERVAL` | 否 | `5184000` | token 主动刷新周期（秒），仅账号模式 |
 | `TOKEN_CACHE_FILE` | 否 | `/data/token.json` | token 缓存路径（已挂载卷） |
+| `WEBUI_PORT` | 否 | `8080` | WebUI 端口（compose 已映射） |
+| `WEBUI_TOKEN` | 否 | 空 | WebUI 访问 token，设置后需 `?token=` 或 `X-Token` 头 |
+| `WEBUI_DISABLE` | 否 | 空 | 设为 `1` 禁用 WebUI |
+| `AUTHORIZE_FILE` | 否 | `/data/authorize.url` | 授权回跳 URL 文件通道 |
 | `GOROUTER_BASE_URL` | 否 | `https://www.gorouter.info` | 云服务地址 |
 | `HOSTS_URLS` | 否 | raw.githubusercontent + jsDelivr 备用 | hosts 数据源，逗号分隔，按序尝试 |
 | `SYNC_INTERVAL_SECONDS` | 否 | `21600` | 同步间隔（秒） |

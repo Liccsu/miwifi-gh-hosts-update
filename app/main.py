@@ -1,16 +1,18 @@
 """同步入口: 拉取 GitHub-IP-hosts 数据并写入小米路由器自定义 Hosts。
 
 云端容器中常驻运行, 每次启动立即同步一次, 之后按 SYNC_INTERVAL_SECONDS
-周期性执行。
+周期性执行。内置 WebUI (WEBUI_PORT, 默认 8080) 展示状态并在需要授权时
+提供交互式授权流程。
 
 token 管理 (持久部署), 按优先级:
 1. 缓存文件 TOKEN_CACHE_FILE (默认 /data/token.json)
 2. 环境变量 MIWIFI_TOKEN
 3. 账号自动刷新: 配置 MIWIFI_XIAOMI_USER / MIWIFI_XIAOMI_PASS 时,
-   通过 passport 登录 + OAuth 授权码自动换取新 token (适用于已信任设备)
-4. 授权链接模式: 程序输出授权 URL, 用户浏览器打开登录小米账号
-   (新设备首次需短信验证, 无法全自动), 把回跳 URL 写入 AUTHORIZE_FILE,
-   程序自动换取并缓存 token。每次 90 天到期后重复该操作即可
+   通过 passport 登录 + OAuth 授权码自动换取新 token (仅限已信任设备;
+   新设备触发安全验证时此路径会失败并转入授权模式)
+4. 交互授权: 程序输出授权 URL, 用户浏览器打开登录小米账号完成授权
+   (新设备首次需短信验证码), 把回跳 URL 提交到 WebUI 或写入
+   AUTHORIZE_FILE, 程序自动换取并缓存 token。90 天到期后重复该操作
 """
 
 import argparse
@@ -20,6 +22,7 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -27,6 +30,7 @@ import urllib.request
 from .gorouter import DEFAULT_APP_ID, DEFAULT_BASE_URL, DEFAULT_SCOPE, GorouterClient, TokenExpiredError
 from .hostsfile import MAX_HOSTS_LEN, merge, parse_hosts, total_length
 from .passport import LoginError, XiaomiAccount
+from .webui import WebUI
 
 logger = logging.getLogger("miwifi-hosts")
 
@@ -38,7 +42,9 @@ DEFAULT_HOSTS_URLS = [
 
 DEFAULT_TOKEN_CACHE_FILE = "/data/token.json"
 DEFAULT_AUTHORIZE_FILE = "/data/authorize.url"
-# 90 天有效期, 提前 30 天主动刷新
+# token 有效期约 90 天 (OAuth 授权 URL 中 expires_in=7776000 秒)
+TOKEN_LIFETIME = 90 * 24 * 3600
+# 提前 30 天主动刷新
 DEFAULT_REFRESH_INTERVAL = 60 * 24 * 3600
 
 _UA = (
@@ -103,6 +109,13 @@ class TokenStore:
             if os.path.exists(tmp):
                 os.unlink(tmp)
 
+    def expires_in_days(self):
+        data = self.load()
+        if not data:
+            return None
+        remaining = int(data.get("issued_at", 0)) + TOKEN_LIFETIME - int(time.time())
+        return max(remaining // 86400, 0)
+
 
 def build_redirect_uri(device_id):
     """构造与真实页面一致的 OAuth 回调地址。
@@ -129,7 +142,7 @@ def build_authorize_url(client, redirect_uri):
 
 
 def parse_authorize_input(text):
-    """从用户粘贴的授权回跳内容中解析 (kind, value)。
+    """从用户提交的授权回跳内容中解析 (kind, value)。
 
     kind 为 "code" (需向 gorouter 换取 token) 或 "token" (直接可用)。
     支持完整 URL (query 中 code / fragment 中 access_token) 或裸值。
@@ -170,63 +183,91 @@ def refresh_token(account, client, store):
     return token
 
 
-def await_authorization(client, store, authorize_file, stop):
-    """授权链接模式: 输出链接, 轮询用户写入的授权文件直到成功。"""
+def apply_authorization(client, store, parsed):
+    """应用用户提交的授权内容 (code 或 token), 成功后缓存。"""
+    kind, value = parsed
+    redirect_uri = build_redirect_uri(client.device_id)
+    if kind == "token":
+        token, scope = value, None
+    else:
+        token, scope = client.exchange_code(value, redirect_uri)
+    client.token = token
+    client.scope = scope or client.scope
+    store.save(token, client.scope)
+    logger.info("授权成功, access_token 已缓存 (有效期约 90 天)")
+
+
+def await_authorization(client, store, authorize_file, stop, webui):
+    """交互授权: 输出授权链接, 等待 WebUI 提交或授权文件, 成功后返回。"""
     redirect_uri = build_redirect_uri(client.device_id)
     url = build_authorize_url(client, redirect_uri)
     logger.warning("=" * 64)
     logger.warning("需要授权: 请用浏览器打开以下链接, 登录小米账号完成授权")
-    logger.warning("(新设备首次登录可能需短信/App 验证码确认, 属正常安全流程)")
+    logger.warning("(新设备首次登录可能需短信验证码确认, 属正常安全流程)")
     logger.warning("  %s", url)
-    logger.warning("授权后浏览器会跳转到 s.miwifi.com, 复制地址栏完整 URL,")
-    logger.warning("写入文件: %s", authorize_file)
-    logger.warning("docker compose 场景: 写入宿主机挂载目录 ./data/authorize.url 即可")
+    if webui:
+        logger.warning("授权后复制地址栏完整 URL, 在 WebUI 页面粘贴提交")
+    logger.warning("或写入文件: %s (docker compose: 宿主机 ./data/authorize.url)", authorize_file)
     logger.warning("=" * 64)
+    if webui:
+        webui.request_authorization(url)
 
     invalid_seen = set()
+    file_checked = 0
     while not stop["flag"]:
-        try:
-            with open(authorize_file, "r", encoding="utf-8") as fh:
-                content = fh.read().strip()
-        except OSError:
-            content = None
-        if content and content not in invalid_seen:
-            parsed = parse_authorize_input(content)
-            if parsed:
-                kind, value = parsed
+        # 通道 1: WebUI 提交
+        if webui:
+            content = webui.poll_code()
+            if content:
+                parsed = parse_authorize_input(content)
                 try:
-                    if kind == "token":
-                        token, scope = value, None
-                    else:
-                        token, scope = client.exchange_code(value, redirect_uri)
-                    client.token = token
-                    client.scope = scope or client.scope
-                    store.save(token, client.scope)
+                    apply_authorization(client, store, parsed)
+                    if webui:
+                        webui.authorization_done()
+                    return
+                except Exception as exc:
+                    logger.error("授权内容无效: %s (code 约 10 分钟内有效, 请重新授权)", exc)
+                    if webui:
+                        webui.update(auth_error=str(exc))
+        # 通道 2: 授权文件 (每 30 秒检查)
+        file_checked += 1
+        if file_checked >= 30:
+            file_checked = 0
+            try:
+                with open(authorize_file, "r", encoding="utf-8") as fh:
+                    content = fh.read().strip()
+            except OSError:
+                content = None
+            if content and content not in invalid_seen:
+                parsed = parse_authorize_input(content)
+                try:
+                    apply_authorization(client, store, parsed)
                     try:
                         os.unlink(authorize_file)
                     except OSError:
                         pass
-                    logger.info("授权成功, access_token 已缓存 (有效期约 90 天)")
+                    if webui:
+                        webui.authorization_done()
                     return
                 except Exception as exc:
                     logger.error("授权内容无效: %s (code 约 10 分钟内有效, 请重新授权)", exc)
                     invalid_seen.add(content)
-        time.sleep(30)
+        time.sleep(1)
     logger.info("授权流程被中断")
 
 
 def run_sync_with_refresh(client, urls, timeout, obtain):
-    """同步一次; token 失效时调用 obtain 重新获取后重试。"""
+    """同步一次; token 失效时调用 obtain 重新获取后重试, 返回同步结果。"""
     try:
-        sync_once(client, urls, timeout)
+        return sync_once(client, urls, timeout)
     except TokenExpiredError:
         logger.warning("access_token 失效, 尝试重新获取")
         obtain()
-        sync_once(client, urls, timeout)
+        return sync_once(client, urls, timeout)
 
 
 def sync_once(client, urls, timeout):
-    """执行一次完整同步, 返回是否发生写入。"""
+    """执行一次完整同步, 返回 (是否写入, 托管条目数, 保留条目数)。"""
     content = fetch_hosts(urls, timeout)
     managed = parse_hosts(content)
     if not managed:
@@ -239,7 +280,7 @@ def sync_once(client, urls, timeout):
     merged = merge(existing, managed)
     if merged == existing:
         logger.info("无变化, 跳过写入 (现有 %d 条)", len(existing))
-        return False
+        return False, len(managed), len(existing) - len(managed)
 
     length = total_length(merged)
     if length > MAX_HOSTS_LEN:
@@ -256,7 +297,7 @@ def sync_once(client, urls, timeout):
         len(managed),
         length,
     )
-    return True
+    return True, len(managed), len(merged) - len(managed)
 
 
 def main(argv=None):
@@ -277,6 +318,14 @@ def main(argv=None):
     authorize_file = _env("AUTHORIZE_FILE", DEFAULT_AUTHORIZE_FILE)
     refresh_interval = int(_env("TOKEN_REFRESH_INTERVAL", str(DEFAULT_REFRESH_INTERVAL)))
 
+    webui = None
+    if not _env("WEBUI_DISABLE", ""):
+        webui = WebUI(
+            port=int(_env("WEBUI_PORT", "8080")),
+            token=_env("WEBUI_TOKEN", ""),
+        )
+        webui.update(sync_interval=f"{int(_env('SYNC_INTERVAL_SECONDS', '21600'))} 秒")
+
     account = XiaomiAccount(user, password) if user and password else None
     cached = store.load()
 
@@ -289,20 +338,26 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    # token 来源优先级: 缓存 > 环境变量 > 账号刷新 > 授权链接
+    # token 来源优先级: 缓存 > 环境变量 > 账号刷新 > 交互授权
     token = cached["token"] if cached else static_token
     scope = (cached or {}).get("scope")
     client = make_client(token or "", scope)
 
     def obtain():
-        """重新获取 token: 优先账号刷新, 否则授权链接模式。"""
+        """重新获取 token: 优先账号刷新, 否则交互授权。"""
         if account:
             try:
                 refresh_token(account, client, store)
                 return
             except LoginError as exc:
-                logger.error("账号自动登录失败: %s, 转入授权链接模式", exc)
-        await_authorization(client, store, authorize_file, stop)
+                logger.error("账号自动登录失败: %s, 转入交互授权", exc)
+        await_authorization(client, store, authorize_file, stop, webui)
+
+    if webui:
+        threading.Thread(target=webui.run, name="webui", daemon=True).start()
+        logger.info("WebUI 已启动: http://localhost:%d", webui.port)
+        if webui.token:
+            logger.info("WebUI 访问需携带 token 参数: http://localhost:%d/?token=%s", webui.port, webui.token)
 
     if not token:
         logger.info("未找到可用 token, 开始获取")
@@ -311,6 +366,17 @@ def main(argv=None):
     urls = [u.strip() for u in _env("HOSTS_URLS", ",".join(DEFAULT_HOSTS_URLS)).split(",") if u.strip()]
     interval = int(_env("SYNC_INTERVAL_SECONDS", "21600"))
     timeout = int(_env("HTTP_TIMEOUT", "30"))
+
+    def report_sync(result):
+        if webui:
+            webui.update(
+                token_ok=True,
+                expires_in_days=store.expires_in_days(),
+                last_sync=time.strftime("%Y-%m-%d %H:%M:%S"),
+                last_result="无变化, 跳过写入" if not result[0] else "写入成功",
+                managed_entries=result[1],
+                manual_entries=result[2],
+            )
 
     logger.info("启动: 数据源 %d 个, 同步间隔 %d 秒", len(urls), interval)
     while not stop["flag"]:
@@ -321,18 +387,33 @@ def main(argv=None):
                 cached_now = store.load()
                 if cached_now and int(time.time()) - int(cached_now.get("issued_at", 0)) >= refresh_interval:
                     refresh_token(account, client, store)
-            run_sync_with_refresh(client, urls, timeout, obtain)
+            result = run_sync_with_refresh(client, urls, timeout, obtain)
+            report_sync(result)
         except LoginError as exc:
             logger.error("账号自动登录失败: %s", exc)
+            if webui:
+                webui.update(token_ok=False, last_result=f"同步失败: {exc}")
         except Exception as exc:
             logger.error("同步失败: %s", exc)
+            if webui:
+                webui.update(token_ok=bool(client.token), last_result=f"同步失败: {exc}")
         if stop["flag"]:
             break
         if args.once:
             break
         elapsed = time.monotonic() - started
-        time.sleep(max(interval - elapsed, 0))
+        remaining = max(interval - elapsed, 0)
+        # 响应 WebUI 手动同步请求, 分片睡眠
+        slept = 0
+        while slept < remaining and not stop["flag"]:
+            if webui and webui.sync_requested.is_set():
+                webui.sync_requested.clear()
+                break
+            time.sleep(1)
+            slept += 1
 
+    if webui:
+        webui.shutdown()
     logger.info("退出")
     return 0
 

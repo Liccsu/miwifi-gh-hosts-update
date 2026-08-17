@@ -95,9 +95,8 @@ class AwaitAuthorizationTest(unittest.TestCase):
             client = mock.Mock()
             client.exchange_code.return_value = ("new-token", "1+1000+3")
             store = mock.Mock()
-            stop = {"flag": False}
-            with mock.patch.object(main, "time", side_effect=[0, 30, 60, 90]):
-                main.await_authorization(client, store, authorize_file, stop)
+            with mock.patch.object(main.time, "sleep", lambda s: None):
+                main.await_authorization(client, store, authorize_file, {"flag": False}, None)
             client.exchange_code.assert_called_once_with("auth-code", mock.ANY)
             store.save.assert_called_once_with("new-token", "1+1000+3")
             self.assertFalse(os.path.exists(authorize_file))
@@ -112,16 +111,16 @@ class AwaitAuthorizationTest(unittest.TestCase):
         try:
             client = mock.Mock()
             client.exchange_code.return_value = ("tok", "s")
+            created = {"flag": False}
 
             def create_file():
-                with open(authorize_file, "w", encoding="utf-8") as fh:
-                    fh.write("bare-code")
+                if not created["flag"]:
+                    created["flag"] = True
+                    with open(authorize_file, "w", encoding="utf-8") as fh:
+                        fh.write("bare-code")
 
-            # 第一次检查文件不存在, 第二次检查前创建
-            client.exchange_code.side_effect = None
-            with mock.patch.object(main, "time") as fake_time:
-                fake_time.sleep = lambda s: create_file()
-                main.await_authorization(client, mock.Mock(), authorize_file, {"flag": False})
+            with mock.patch.object(main.time, "sleep", lambda s: create_file()):
+                main.await_authorization(client, mock.Mock(), authorize_file, {"flag": False}, None)
             client.exchange_code.assert_called_once()
         finally:
             import shutil
@@ -134,16 +133,20 @@ class SyncOnceTest(unittest.TestCase):
         client = mock.Mock()
         client.get_hosts.return_value = parse_hosts("1.1.1.1 github.com\n")
         with mock.patch.object(main, "fetch_hosts", return_value="1.1.1.1 github.com\n") as fetch:
-            changed = sync_once(client, ["u"], 30)
+            changed, managed, manual = sync_once(client, ["u"], 30)
         self.assertFalse(changed)
+        self.assertEqual(managed, 1)
+        self.assertEqual(manual, 0)
         client.set_hosts.assert_not_called()
 
     def test_writes_merged_hosts(self):
         client = mock.Mock()
         client.get_hosts.return_value = ["9.9.9.9 my-router.local"]
         with mock.patch.object(main, "fetch_hosts", return_value="1.1.1.1 github.com\n"):
-            changed = sync_once(client, ["u"], 30)
+            changed, managed, manual = sync_once(client, ["u"], 30)
         self.assertTrue(changed)
+        self.assertEqual(managed, 1)
+        self.assertEqual(manual, 1)
         merged = client.set_hosts.call_args.args[0]
         self.assertEqual(merged, ["9.9.9.9 my-router.local", "1.1.1.1 github.com"])
         self.assertLessEqual(total_length(merged), main.MAX_HOSTS_LEN)
