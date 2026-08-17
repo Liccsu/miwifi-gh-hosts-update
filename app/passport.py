@@ -75,24 +75,28 @@ class XiaomiAccount:
             timeout=self.timeout,
         )
 
-    def _open_json(self, url, data=None):
+    def _passport_json(self, url, data=None):
+        """请求 passport 接口并解析 JSON (响应带 &&&START&&& JSONP 前缀)。"""
         with self._open(url, data, {"Accept": "application/json"}) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            body = resp.read().decode("utf-8")
+        body = body.split("&&&START&&&", 1)[-1].strip()
+        return json.loads(body)
 
     def login(self):
         """执行 passport 登录, 建立会话 cookie。失败抛 LoginError。"""
-        url = (
-            f"{self.base_url}/pass/sid?sid={SID}&ts={int(time.time() * 1000)}&_json=true"
-        )
-        data = self._open_json(url)
-        if data.get("code") != 0:
-            raise LoginError(f"pass/sid 失败: code={data.get('code')} {data.get('description', '')}")
-        sign = data["sign"]
-
+        sign = self._fetch_sign()
         logged = self._submit_credentials(sign)
         # 跟随跳转链完成登录态 (location 指向带 serviceToken 的页面)
         self._open(logged["location"])
         return logged
+
+    def _fetch_sign(self):
+        url = f"{self.base_url}/pass/serviceLogin?sid={SID}&_json=true"
+        data = self._passport_json(url)
+        sign = data.get("_sign")
+        if not sign:
+            raise LoginError(f"pass/serviceLogin 失败: code={data.get('code')} {data.get('description', '')}")
+        return sign
 
     def _submit_credentials(self, sign):
         # 两种摘要风格先后尝试, 兼容不同账号体系
@@ -104,7 +108,7 @@ class XiaomiAccount:
             fields = {
                 "sid": SID,
                 "hash": pwd_hash,
-                "callback": "",
+                "callback": "https://sts.api.io.mi.com/sts",
                 "qs": urllib.parse.quote(f"?sid={SID}&_json=true", safe=""),
                 "user": self.user,
                 "_sign": sign,
@@ -112,10 +116,10 @@ class XiaomiAccount:
             }
             body = urllib.parse.urlencode(fields).encode("utf-8")
             try:
-                data = self._open_json(f"{self.base_url}/pass/serviceLoginAuth2", body)
-            except urllib.error.HTTPError as exc:
+                data = self._passport_json(f"{self.base_url}/pass/serviceLoginAuth2", body)
+            except (urllib.error.HTTPError, ValueError) as exc:
                 if attempt == "v2":
-                    raise LoginError(f"登录请求被拒绝: HTTP {exc.code}") from exc
+                    raise LoginError(f"登录请求被拒绝: {exc}") from exc
                 continue
             code = data.get("code")
             if code == 0:
@@ -157,7 +161,7 @@ class XiaomiAccount:
             f"&clientId={client_id}"
             f"&redirectUri={urllib.parse.quote(redirect_uri, safe='')}"
         )
-        data = self._open_json(url)
+        data = self._passport_json(url)
         if data.get("code") != 0 or not data.get("data"):
             raise LoginError(f"换取 token 失败: {json.dumps(data, ensure_ascii=False)[:200]}")
         payload = data["data"]

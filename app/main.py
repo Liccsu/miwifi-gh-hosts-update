@@ -3,12 +3,14 @@
 云端容器中常驻运行, 每次启动立即同步一次, 之后按 SYNC_INTERVAL_SECONDS
 周期性执行。
 
-token 管理 (持久部署):
-- 配置 MIWIFI_XIAOMI_USER / MIWIFI_XIAOMI_PASS 后, 程序通过小米账号自动
-  刷新 access_token (passport 登录 -> OAuth 授权码 -> gorouter 换 token),
-  新 token 缓存到 TOKEN_CACHE_FILE, 到期 (TOKEN_REFRESH_INTERVAL, 默认 60 天,
-  早于 90 天有效期) 或失效 (HTTP 401 / code 3001) 时自动刷新, 无需人工干预
-- 仅配置 MIWIFI_TOKEN 时保持静态 token 模式, 失效后输出 ERROR 日志等待人工更新
+token 管理 (持久部署), 按优先级:
+1. 缓存文件 TOKEN_CACHE_FILE (默认 /data/token.json)
+2. 环境变量 MIWIFI_TOKEN
+3. 账号自动刷新: 配置 MIWIFI_XIAOMI_USER / MIWIFI_XIAOMI_PASS 时,
+   通过 passport 登录 + OAuth 授权码自动换取新 token (适用于已信任设备)
+4. 授权链接模式: 程序输出授权 URL, 用户浏览器打开登录小米账号
+   (新设备首次需短信验证, 无法全自动), 把回跳 URL 写入 AUTHORIZE_FILE,
+   程序自动换取并缓存 token。每次 90 天到期后重复该操作即可
 """
 
 import argparse
@@ -19,6 +21,7 @@ import signal
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 
 from .gorouter import DEFAULT_APP_ID, DEFAULT_BASE_URL, DEFAULT_SCOPE, GorouterClient, TokenExpiredError
@@ -34,6 +37,7 @@ DEFAULT_HOSTS_URLS = [
 ]
 
 DEFAULT_TOKEN_CACHE_FILE = "/data/token.json"
+DEFAULT_AUTHORIZE_FILE = "/data/authorize.url"
 # 90 天有效期, 提前 30 天主动刷新
 DEFAULT_REFRESH_INTERVAL = 60 * 24 * 3600
 
@@ -111,6 +115,36 @@ def build_redirect_uri(device_id):
     )
 
 
+def build_authorize_url(client, redirect_uri):
+    """构造 OAuth 授权链接 (用户浏览器打开, 登录后回跳携带 code)。"""
+    return (
+        "https://account.xiaomi.com/oauth2/authorize"
+        f"?client_id={client.app_id}"
+        f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
+        "&response_type=code&skip_confirm=true"
+    )
+
+
+def parse_authorize_input(text):
+    """从用户粘贴的授权回跳内容中解析 (kind, value)。
+
+    kind 为 "code" (需向 gorouter 换取 token) 或 "token" (直接可用)。
+    支持完整 URL (query 中 code / fragment 中 access_token) 或裸值。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    if "://" in text:
+        split = urllib.parse.urlsplit(text)
+        query = urllib.parse.parse_qs(split.query)
+        if query.get("code"):
+            return ("code", query["code"][0])
+        fragment = urllib.parse.parse_qs(split.fragment)
+        if fragment.get("access_token"):
+            return ("token", fragment["access_token"][0])
+    return ("code", text)
+
+
 def make_client(token, scope):
     return GorouterClient(
         token=token,
@@ -123,7 +157,7 @@ def make_client(token, scope):
 
 
 def refresh_token(account, client, store):
-    """账号登录 -> OAuth 授权码 -> 换 token, 更新 client 并写缓存。"""
+    """账号自动刷新: passport 登录 -> OAuth 授权码 -> 换 token。"""
     redirect_uri = build_redirect_uri(client.device_id)
     token, scope = account.refresh_token(client.app_id, redirect_uri)
     client.token = token
@@ -131,6 +165,61 @@ def refresh_token(account, client, store):
     store.save(token, client.scope)
     logger.info("access_token 已通过账号自动刷新")
     return token
+
+
+def await_authorization(client, store, authorize_file, stop):
+    """授权链接模式: 输出链接, 轮询用户写入的授权文件直到成功。"""
+    redirect_uri = build_redirect_uri(client.device_id)
+    url = build_authorize_url(client, redirect_uri)
+    logger.warning("=" * 64)
+    logger.warning("需要授权: 请用浏览器打开以下链接, 登录小米账号完成授权")
+    logger.warning("(新设备首次登录可能需短信/App 验证码确认, 属正常安全流程)")
+    logger.warning("  %s", url)
+    logger.warning("授权后浏览器会跳转到 s.miwifi.com, 复制地址栏完整 URL,")
+    logger.warning("写入文件: %s", authorize_file)
+    logger.warning("docker compose 场景: 写入宿主机挂载目录 ./data/authorize.url 即可")
+    logger.warning("=" * 64)
+
+    invalid_seen = set()
+    while not stop["flag"]:
+        try:
+            with open(authorize_file, "r", encoding="utf-8") as fh:
+                content = fh.read().strip()
+        except OSError:
+            content = None
+        if content and content not in invalid_seen:
+            parsed = parse_authorize_input(content)
+            if parsed:
+                kind, value = parsed
+                try:
+                    if kind == "token":
+                        token, scope = value, None
+                    else:
+                        token, scope = client.exchange_code(value, redirect_uri)
+                    client.token = token
+                    client.scope = scope or client.scope
+                    store.save(token, client.scope)
+                    try:
+                        os.unlink(authorize_file)
+                    except OSError:
+                        pass
+                    logger.info("授权成功, access_token 已缓存 (有效期约 90 天)")
+                    return
+                except Exception as exc:
+                    logger.error("授权内容无效: %s (code 约 10 分钟内有效, 请重新授权)", exc)
+                    invalid_seen.add(content)
+        time.sleep(30)
+    logger.info("授权流程被中断")
+
+
+def run_sync_with_refresh(client, urls, timeout, obtain):
+    """同步一次; token 失效时调用 obtain 重新获取后重试。"""
+    try:
+        sync_once(client, urls, timeout)
+    except TokenExpiredError:
+        logger.warning("access_token 失效, 尝试重新获取")
+        obtain()
+        sync_once(client, urls, timeout)
 
 
 def sync_once(client, urls, timeout):
@@ -167,19 +256,6 @@ def sync_once(client, urls, timeout):
     return True
 
 
-def run_sync(client, urls, timeout, account, store):
-    """执行同步; token 失效且有账号时自动刷新并重试一次。"""
-    try:
-        sync_once(client, urls, timeout)
-        return
-    except TokenExpiredError:
-        if not account:
-            raise
-        logger.info("token 失效, 尝试账号自动刷新")
-        refresh_token(account, client, store)
-        sync_once(client, urls, timeout)
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description="同步 GitHub-IP-hosts 到小米路由器自定义 Hosts")
     parser.add_argument("--once", action="store_true", help="只执行一次同步后退出 (默认常驻循环)")
@@ -193,28 +269,13 @@ def main(argv=None):
     static_token = _env("MIWIFI_TOKEN")
     user = _env("MIWIFI_XIAOMI_USER")
     password = _env("MIWIFI_XIAOMI_PASS")
-    if not static_token and not (user and password):
-        parser.error("必须设置 MIWIFI_TOKEN, 或提供 MIWIFI_XIAOMI_USER / MIWIFI_XIAOMI_PASS 以便自动获取")
 
     store = TokenStore(_env("TOKEN_CACHE_FILE", DEFAULT_TOKEN_CACHE_FILE))
+    authorize_file = _env("AUTHORIZE_FILE", DEFAULT_AUTHORIZE_FILE)
     refresh_interval = int(_env("TOKEN_REFRESH_INTERVAL", str(DEFAULT_REFRESH_INTERVAL)))
 
     account = XiaomiAccount(user, password) if user and password else None
     cached = store.load()
-
-    # token 来源优先级: 缓存 > 环境变量 > (有账号时) 自动刷新
-    token = cached["token"] if cached else static_token
-    scope = (cached or {}).get("scope")
-    client = make_client(token or "", scope)
-
-    if token:
-        logger.info("使用 %s token", "缓存" if cached else "环境变量")
-    if account and not token:
-        refresh_token(account, client, store)
-
-    urls = [u.strip() for u in _env("HOSTS_URLS", ",".join(DEFAULT_HOSTS_URLS)).split(",") if u.strip()]
-    interval = int(_env("SYNC_INTERVAL_SECONDS", "21600"))
-    timeout = int(_env("HTTP_TIMEOUT", "30"))
 
     stop = {"flag": False}
 
@@ -225,6 +286,29 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
+    # token 来源优先级: 缓存 > 环境变量 > 账号刷新 > 授权链接
+    token = cached["token"] if cached else static_token
+    scope = (cached or {}).get("scope")
+    client = make_client(token or "", scope)
+
+    def obtain():
+        """重新获取 token: 优先账号刷新, 否则授权链接模式。"""
+        if account:
+            try:
+                refresh_token(account, client, store)
+                return
+            except LoginError as exc:
+                logger.error("账号自动登录失败: %s, 转入授权链接模式", exc)
+        await_authorization(client, store, authorize_file, stop)
+
+    if not token:
+        logger.info("未找到可用 token, 开始获取")
+        obtain()
+
+    urls = [u.strip() for u in _env("HOSTS_URLS", ",".join(DEFAULT_HOSTS_URLS)).split(",") if u.strip()]
+    interval = int(_env("SYNC_INTERVAL_SECONDS", "21600"))
+    timeout = int(_env("HTTP_TIMEOUT", "30"))
+
     logger.info("启动: 数据源 %d 个, 同步间隔 %d 秒", len(urls), interval)
     while not stop["flag"]:
         started = time.monotonic()
@@ -234,12 +318,7 @@ def main(argv=None):
                 cached_now = store.load()
                 if cached_now and int(time.time()) - int(cached_now.get("issued_at", 0)) >= refresh_interval:
                     refresh_token(account, client, store)
-            run_sync(client, urls, timeout, account, store)
-        except TokenExpiredError:
-            logger.error(
-                "access_token 失效且无可用账号凭据。请更新 MIWIFI_TOKEN 环境变量"
-                "或配置 MIWIFI_XIAOMI_USER / MIWIFI_XIAOMI_PASS 后重启容器"
-            )
+            run_sync_with_refresh(client, urls, timeout, obtain)
         except LoginError as exc:
             logger.error("账号自动登录失败: %s", exc)
         except Exception as exc:

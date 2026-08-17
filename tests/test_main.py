@@ -1,4 +1,4 @@
-"""main 模块单元测试: token 缓存与失效自动刷新。"""
+"""main 模块单元测试: token 缓存、失效自动刷新与授权链接模式。"""
 
 import json
 import os
@@ -8,8 +8,8 @@ from unittest import mock
 
 from app import main
 from app.gorouter import TokenExpiredError
-from app.hostsfile import merge, parse_hosts, total_length
-from app.main import TokenStore, run_sync, sync_once
+from app.hostsfile import parse_hosts, total_length
+from app.main import TokenStore, parse_authorize_input, run_sync_with_refresh, sync_once
 
 
 class TokenStoreTest(unittest.TestCase):
@@ -45,35 +45,88 @@ class TokenStoreTest(unittest.TestCase):
         self.assertEqual(store.load()["token"], "tok-2")
 
 
-class RunSyncTest(unittest.TestCase):
-    def test_token_expired_refreshes_and_retries(self):
+class ParseAuthorizeInputTest(unittest.TestCase):
+    def test_full_url_with_code_in_query(self):
+        kind, value = parse_authorize_input(
+            "http://s.miwifi.com/dist/userhosts/index.html?gatewayIp=1.1.1.1&code=abc123"
+        )
+        self.assertEqual((kind, value), ("code", "abc123"))
+
+    def test_full_url_with_token_in_fragment(self):
+        kind, value = parse_authorize_input(
+            "http://s.miwifi.com/dist/userhosts/index.html#access_token=tok-xyz&expires_in=7776000"
+        )
+        self.assertEqual((kind, value), ("token", "tok-xyz"))
+
+    def test_bare_value(self):
+        self.assertEqual(parse_authorize_input("raw-code-42"), ("code", "raw-code-42"))
+
+    def test_empty_returns_none(self):
+        self.assertIsNone(parse_authorize_input("   "))
+        self.assertIsNone(parse_authorize_input(None))
+
+
+class RunSyncWithRefreshTest(unittest.TestCase):
+    def test_token_expired_calls_obtain_and_retries(self):
         client = mock.Mock()
-        # 首次 get_hosts 抛 token 失效, 刷新后重试成功
         client.get_hosts.side_effect = [TokenExpiredError("expired"), ["1.1.1.1 a.com"]]
-        account = mock.Mock()
-        store = mock.Mock()
-        with mock.patch.object(main, "fetch_hosts", return_value="1.1.1.1 a.com\n"), mock.patch.object(
-            main, "refresh_token"
-        ) as refresh:
-            run_sync(client, ["u"], 30, account, store)
-            refresh.assert_called_once_with(account, client, store)
-            self.assertEqual(client.get_hosts.call_count, 2)
-
-    def test_token_expired_without_account_raises(self):
-        client = mock.Mock()
-        client.get_hosts.side_effect = TokenExpiredError("expired")
+        obtain = mock.Mock()
         with mock.patch.object(main, "fetch_hosts", return_value="1.1.1.1 a.com\n"):
-            with self.assertRaises(TokenExpiredError):
-                run_sync(client, ["u"], 30, None, mock.Mock())
+            run_sync_with_refresh(client, ["u"], 30, obtain)
+        obtain.assert_called_once_with()
+        self.assertEqual(client.get_hosts.call_count, 2)
 
-    def test_success_no_refresh(self):
+    def test_success_no_obtain(self):
         client = mock.Mock()
         client.get_hosts.return_value = ["1.1.1.1 a.com"]
-        with mock.patch.object(main, "fetch_hosts", return_value="1.1.1.1 a.com\n"), mock.patch.object(
-            main, "refresh_token"
-        ) as refresh:
-            run_sync(client, ["u"], 30, mock.Mock(), mock.Mock())
-            refresh.assert_not_called()
+        obtain = mock.Mock()
+        with mock.patch.object(main, "fetch_hosts", return_value="1.1.1.1 a.com\n"):
+            run_sync_with_refresh(client, ["u"], 30, obtain)
+        obtain.assert_not_called()
+
+
+class AwaitAuthorizationTest(unittest.TestCase):
+    def test_exchanges_code_and_caches_token(self):
+        tmpdir = tempfile.mkdtemp()
+        authorize_file = os.path.join(tmpdir, "authorize.url")
+        with open(authorize_file, "w", encoding="utf-8") as fh:
+            fh.write("http://s.miwifi.com/dist/userhosts/index.html?code=auth-code")
+        try:
+            client = mock.Mock()
+            client.exchange_code.return_value = ("new-token", "1+1000+3")
+            store = mock.Mock()
+            stop = {"flag": False}
+            with mock.patch.object(main, "time", side_effect=[0, 30, 60, 90]):
+                main.await_authorization(client, store, authorize_file, stop)
+            client.exchange_code.assert_called_once_with("auth-code", mock.ANY)
+            store.save.assert_called_once_with("new-token", "1+1000+3")
+            self.assertFalse(os.path.exists(authorize_file))
+        finally:
+            import shutil
+
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_waits_until_file_appears(self):
+        tmpdir = tempfile.mkdtemp()
+        authorize_file = os.path.join(tmpdir, "authorize.url")
+        try:
+            client = mock.Mock()
+            client.exchange_code.return_value = ("tok", "s")
+
+            def create_file():
+                with open(authorize_file, "w", encoding="utf-8") as fh:
+                    fh.write("bare-code")
+
+            # 第一次检查文件不存在, 第二次检查前创建
+            client.exchange_code.side_effect = None
+            with mock.patch.object(main, "time") as fake_time:
+                fake_time.sleep = lambda s: create_file()
+                main.await_authorization(client, mock.Mock(), authorize_file, {"flag": False})
+            client.exchange_code.assert_called_once()
+        finally:
+            import shutil
+
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 class SyncOnceTest(unittest.TestCase):

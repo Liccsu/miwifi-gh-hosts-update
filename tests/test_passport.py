@@ -19,14 +19,14 @@ class PasswordHashTest(unittest.TestCase):
 class LoginFlowTest(unittest.TestCase):
     def setUp(self):
         self.acc = XiaomiAccount("user@example.com", "secret")
-        self.acc._open_json = mock.Mock()
+        self.acc._passport_json = mock.Mock()
         self.acc._open = mock.Mock()
 
     def _sid_ok(self, sign="s3cret-sign"):
-        return {"code": 0, "sign": sign}
+        return {"_sign": sign}
 
     def test_login_success(self):
-        self.acc._open_json.side_effect = [
+        self.acc._passport_json.side_effect = [
             self._sid_ok(),
             {"code": 0, "userId": "123", "location": "https://account.xiaomi.com/finish"},
         ]
@@ -34,13 +34,13 @@ class LoginFlowTest(unittest.TestCase):
         self.assertEqual(result["userId"], "123")
         self.acc._open.assert_called_once_with("https://account.xiaomi.com/finish")
         # 提交的字段包含账号与摘要
-        args, _ = self.acc._open_json.call_args_list[1]
+        args, _ = self.acc._passport_json.call_args_list[1]
         body = args[1].decode()
         self.assertIn("user=user%40example.com", body)
         self.assertIn("_sign=s3cret-sign", body)
 
     def test_login_captcha_raises(self):
-        self.acc._open_json.side_effect = [
+        self.acc._passport_json.side_effect = [
             self._sid_ok(),
             {"code": 87001, "description": "captcha required"},
         ]
@@ -49,7 +49,7 @@ class LoginFlowTest(unittest.TestCase):
         self.assertIn("验证码", str(ctx.exception))
 
     def test_login_wrong_password_raises(self):
-        self.acc._open_json.side_effect = [
+        self.acc._passport_json.side_effect = [
             self._sid_ok(),
             {"code": 70016, "description": "password wrong"},  # v1 摘要失败
             {"code": 70016, "description": "password wrong"},  # v2 摘要也失败
@@ -59,7 +59,7 @@ class LoginFlowTest(unittest.TestCase):
         self.assertIn("账号或密码错误", str(ctx.exception))
 
     def test_sid_failure_raises(self):
-        self.acc._open_json.side_effect = [{"code": -1, "description": "bad"}]
+        self.acc._passport_json.side_effect = [{"code": -1, "description": "bad"}]
         with self.assertRaises(LoginError):
             self.acc.login()
 
@@ -84,7 +84,7 @@ class LoginFlowTest(unittest.TestCase):
             self.acc.get_auth_code("app-id", "http://s.miwifi.com/dist/userhosts/index.html")
 
     def test_exchange_token(self):
-        self.acc._open_json.return_value = {
+        self.acc._passport_json.return_value = {
             "code": 0,
             "data": {"access_token": "tok-1", "scope": "1+1000+3"},
         }
@@ -92,7 +92,7 @@ class LoginFlowTest(unittest.TestCase):
         self.assertEqual((token, scope), ("tok-1", "1+1000+3"))
 
     def test_exchange_token_failure_raises(self):
-        self.acc._open_json.return_value = {"code": -1, "msg": "bad code"}
+        self.acc._passport_json.return_value = {"code": -1, "msg": "bad code"}
         with self.assertRaises(LoginError):
             self.acc.exchange_token("bad", "app-id", "http://redirect")
 

@@ -96,3 +96,20 @@ class GorouterClient:
         url = self.base_url + PATH_CUSTOM_HOST_SET
         logger.debug("POST %s (%d entries)", url, len(entries))
         return self._check(self._open(url, body))
+
+    def exchange_code(self, code, redirect_uri):
+        """用 OAuth 授权码换取 access_token, 返回 (token, scope)。
+
+        经小米内部服务 gorouter 完成, 无需 client_secret。
+        """
+        url = (
+            self.base_url + "/oauth/get_acc_token"
+            f"?code={urllib.parse.quote(code, safe='')}"
+            f"&clientId={self.app_id}"
+            f"&redirectUri={urllib.parse.quote(redirect_uri, safe='')}"
+        )
+        data = self._open(url)
+        if data.get("code") != 0 or not data.get("data"):
+            raise ApiError(f"换取 token 失败: {json.dumps(data, ensure_ascii=False)[:200]}")
+        payload = data["data"]
+        return payload["access_token"], payload.get("scope")
