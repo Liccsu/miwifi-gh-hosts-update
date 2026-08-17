@@ -125,12 +125,17 @@ def build_redirect_uri(device_id):
 
 
 def build_authorize_url(client, redirect_uri):
-    """构造 OAuth 授权链接 (用户浏览器打开, 登录后回跳携带 code)。"""
+    """构造 OAuth 授权链接 (v1 implicit flow)。
+
+    使用 response_type=token: 用户浏览器授权后跳回 redirect_uri,
+    地址栏 fragment 直接携带 access_token (有效期 90 天), 无需
+    二次换取, 稳定可靠。
+    """
     return (
         "https://account.xiaomi.com/oauth2/authorize"
         f"?client_id={client.app_id}"
         f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
-        "&response_type=code&skip_confirm=true"
+        "&response_type=token"
     )
 
 
@@ -187,7 +192,7 @@ def await_authorization(client, store, authorize_file, stop, webui):
     logger.warning("(新设备首次登录可能需短信验证码确认, 属正常安全流程)")
     logger.warning("  %s", url)
     if webui:
-        logger.warning("授权后复制地址栏完整 URL, 在 WebUI 页面粘贴提交")
+        logger.warning("授权后复制地址栏完整 URL (含 #access_token), 在 WebUI 页面粘贴提交")
     logger.warning("或写入文件: %s (docker compose: 宿主机 ./data/authorize.url)", authorize_file)
     logger.warning("=" * 64)
     if webui:
