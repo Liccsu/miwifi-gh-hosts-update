@@ -6,3 +6,6 @@ services:
     env_file: .env
     environment:
       - TZ=Asia/Shanghai
+    volumes:
+      # token 缓存 (账号模式下自动刷新后持久化, 避免频繁登录)
+      - ./data:/data

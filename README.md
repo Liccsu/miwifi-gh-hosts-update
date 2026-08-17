@@ -27,10 +27,27 @@
 
 ## 获取与更新 token
 
+### 方式一（推荐）：账号密码自动刷新
+
+在 `.env` 中配置 `MIWIFI_XIAOMI_USER`（小米账号）与 `MIWIFI_XIAOMI_PASS`（密码），
+程序启动时自动执行 passport 登录 -> OAuth 授权 -> 换取 `access_token`，
+并将新 token 缓存到 `TOKEN_CACHE_FILE`（默认 `/data/token.json`，已挂载卷）。
+
+token 有效期约 90 天，程序在 60 天（`TOKEN_REFRESH_INTERVAL` 可调）时提前主动刷新，
+失效（HTTP 401 / code 3001）时即时刷新并重试同步，全程无需人工干预。
+
+> 风险说明：
+> - 账号开启二次验证或触发风控时，小米会要求验证码，自动登录将失败，
+>   程序输出 ERROR 日志并停止刷新，此时需改用方式二或临时手动处理
+> - 自动登录可能触发小米的异常登录提醒，属正常现象
+> - 账号凭据仅保存在 `.env` 中，请勿提交到 git、注意容器所在主机的访问权限
+
+### 方式二：手动 token
+
 1. 浏览器打开自定义 Hosts 页面（`http://s.miwifi.com/dist/userhosts/index.html`，`gatewayIp` 改为路由器网关 IP），登录小米账号授权
 2. 地址栏 URL 中 `#access_token=...` 后面的值即 `MIWIFI_TOKEN`，`deviceID=...` 即 `MIWIFI_DEVICE_ID`
 3. token 有效期约 90 天（URL 中 `expires_in=7776000` 秒）。过期后程序会持续输出
-   `access_token 已失效` 错误日志，此时重复步骤 1 获取新 token，更新 `.env` 后重启容器即可，无需其他操作
+   `access_token 已失效` 错误日志，此时重复步骤 1 获取新 token，更新 `.env` 后重启容器即可
 
 ## 部署
 
@@ -57,10 +74,14 @@ docker compose logs -f
 
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
-| `MIWIFI_TOKEN` | 是 | - | 小米账号授权 access_token，来自页面 URL |
+| `MIWIFI_XIAOMI_USER` | 二选一 | - | 小米账号，账号自动刷新模式 |
+| `MIWIFI_XIAOMI_PASS` | 二选一 | - | 小米账号密码，账号自动刷新模式 |
+| `MIWIFI_TOKEN` | 二选一 | - | 手动 access_token，来自页面 URL |
 | `MIWIFI_DEVICE_ID` | 是 | - | 路由器设备 ID，来自页面 URL 的 `deviceID` |
 | `MIWIFI_APP_ID` | 否 | `2882303761517675329` | 应用 ID（页面固定值） |
 | `MIWIFI_SCOPE` | 否 | `1+1000+3` | 授权 scope（页面固定值） |
+| `TOKEN_REFRESH_INTERVAL` | 否 | `5184000` | token 主动刷新周期（秒），仅账号模式 |
+| `TOKEN_CACHE_FILE` | 否 | `/data/token.json` | token 缓存路径（已挂载卷） |
 | `GOROUTER_BASE_URL` | 否 | `https://www.gorouter.info` | 云服务地址 |
 | `HOSTS_URLS` | 否 | raw.githubusercontent + jsDelivr 备用 | hosts 数据源，逗号分隔，按序尝试 |
 | `SYNC_INTERVAL_SECONDS` | 否 | `21600` | 同步间隔（秒） |

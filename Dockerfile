@@ -9,7 +9,8 @@ COPY app/ ./app/
 
 RUN addgroup -S -g 10001 appuser && \
     adduser -S -D -H -u 10001 -G appuser appuser && \
-    chown -R appuser:appuser /app
+    mkdir -p /data && \
+    chown -R appuser:appuser /app /data
 
 USER appuser
 
