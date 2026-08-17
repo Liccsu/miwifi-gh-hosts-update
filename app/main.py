@@ -105,13 +105,16 @@ class TokenStore:
 
 
 def build_redirect_uri(device_id):
-    """构造与真实页面一致的 OAuth 回调地址。"""
+    """构造与真实页面一致的 OAuth 回调地址。
+
+    必须保持确定性: get_acc_token 会校验 redirect_uri 与授权时一致,
+    因此不能包含每次变化的时间戳等参数。
+    """
     gateway = _env("MIWIFI_GATEWAY_IP", "192.168.1.1")
     model = _env("MIWIFI_MODEL", "xiaomi.router.rd15")
     return (
         "http://s.miwifi.com/dist/userhosts/index.html"
-        f"?gatewayIp={gateway}&language=zh&model={model}"
-        f"&deviceID={device_id}&t={int(time.time() * 1000)}"
+        f"?gatewayIp={gateway}&language=zh&model={model}&deviceID={device_id}"
     )
 
 
