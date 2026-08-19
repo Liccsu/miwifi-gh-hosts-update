@@ -202,13 +202,41 @@ class XiaomiAccount:
             "&trust=false&_json=true"
         ).encode("utf-8")
         resp = self._passport_json(f"{self.base_url}/identity/auth/verifyPhone", body)
-        # 调试: 记录完整响应 (用于逆向 identityToken 来源)
         logger.debug("verifyPhone 响应: %s", json.dumps(resp, ensure_ascii=False)[:600])
         if resp.get("code") != 0:
             raise LoginError(
                 f"验证码校验失败: {json.dumps(resp, ensure_ascii=False)}"
             )
         logger.info("验证码校验通过, 会话已具备已验证身份")
+        # 服务端直接返回 result/check 跳转地址 (含 identityToken + _sign),
+        # 无需客户端签名; 跟随该链完成登录态 (result/check -> end -> sts)
+        check_url = resp.get("location")
+        if check_url:
+            self._follow_verification_chain(check_url)
+        else:
+            logger.warning("verifyPhone 响应缺少 location, 登录态可能不完整")
+
+    def _follow_verification_chain(self, check_url):
+        """跟随验证完成链: result/check -> serviceLoginAuth2/end -> sts。
+
+        各跳转地址由服务端在响应中签发, 程序仅逐级跟随。
+        """
+        url = check_url
+        for step in range(4):
+            if not url:
+                break
+            try:
+                resp = self._open(url)
+                final = resp.geturl()
+                logger.debug("完成链 step%d: %s -> %s", step, url[:90], final[:110])
+            except urllib.error.HTTPError as exc:
+                final = exc.headers.get("Location", "")
+                logger.debug("完成链 step%d: %s -> HTTP %s Location=%s",
+                             step, url[:90], exc.code, final[:110])
+            url = final
+        logger.debug(
+            "登录态 cookies: %s", sorted(c.name for c in self._cookie_jar)
+        )
 
     # ---------- access_token ----------
 
