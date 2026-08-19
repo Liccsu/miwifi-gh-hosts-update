@@ -216,7 +216,7 @@ refresh();setInterval(refresh,5000);
 class WebUI:
     """线程安全的 WebUI 服务与状态容器。"""
 
-    def __init__(self, port=8080, token=None):
+    def __init__(self, port=8571, token=None):
         self.port = port
         self.token = token or ""
         self.auth_codes = queue.Queue()

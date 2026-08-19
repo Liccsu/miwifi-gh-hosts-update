@@ -30,7 +30,7 @@
 ### 方式一（推荐）：WebUI 交互授权
 
 token 缺失或失效时，程序输出授权链接并进入等待状态，WebUI（默认
-`http://<服务器>:8080`）页面会显示"需要授权"面板：
+`http://<服务器>:8571`）页面会显示"需要授权"面板：
 
 1. 点击页面上的授权链接，浏览器打开小米账号登录页
 2. 登录小米账号并授权（新设备首次需短信验证码确认，属安全流程）
@@ -85,7 +85,7 @@ docker compose logs -f
 
 ### 3. 访问 WebUI
 
-浏览器打开 `http://<服务器IP>:8080`，可查看同步状态与 token 有效期；
+浏览器打开 `http://<服务器IP>:8571`，可查看同步状态与 token 有效期；
 token 失效需要授权时页面会显示授权入口（见下文"获取与更新 token"）。
 
 
@@ -101,7 +101,7 @@ token 失效需要授权时页面会显示授权入口（见下文"获取与更�
 | `MIWIFI_SCOPE` | 否 | `1+1000+3` | 授权 scope（页面固定值） |
 | `TOKEN_REFRESH_INTERVAL` | 否 | `5184000` | token 主动刷新周期（秒），仅账号模式 |
 | `TOKEN_CACHE_FILE` | 否 | `/data/token.json` | token 缓存路径（已挂载卷） |
-| `WEBUI_PORT` | 否 | `8080` | WebUI 端口（compose 已映射） |
+| `WEBUI_PORT` | 否 | `8571` | WebUI 端口（compose 已映射） |
 | `WEBUI_TOKEN` | 否 | 空 | WebUI 访问 token，设置后需 `?token=` 或 `X-Token` 头 |
 | `WEBUI_DISABLE` | 否 | 空 | 设为 `1` 禁用 WebUI |
 | `AUTHORIZE_FILE` | 否 | `/data/authorize.url` | 授权回跳 URL 文件通道 |

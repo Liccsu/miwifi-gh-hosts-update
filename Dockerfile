@@ -14,6 +14,6 @@ RUN addgroup -S -g 10001 appuser && \
 
 USER appuser
 
-EXPOSE 8080
+EXPOSE 8571
 
 ENTRYPOINT ["python", "-m", "app"]

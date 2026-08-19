@@ -8,7 +8,7 @@ services:
       - TZ=Asia/Shanghai
     ports:
       # WebUI: 状态查看与授权操作
-      - "8080:8080"
+      - "8571:8571"
     volumes:
       # token 缓存 (授权后持久化, 避免重复授权) 与授权文件通道
       - ./data:/data

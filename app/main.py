@@ -1,7 +1,7 @@
 """同步入口: 拉取 GitHub-IP-hosts 数据并写入小米路由器自定义 Hosts。
 
 云端容器中常驻运行, 每次启动立即同步一次, 之后按 SYNC_INTERVAL_SECONDS
-周期性执行。内置 WebUI (WEBUI_PORT, 默认 8080) 展示状态并提供交互:
+周期性执行。内置 WebUI (WEBUI_PORT, 默认 8571) 展示状态并提供交互:
 - 配置账号密码时, 登录流程完全由程序自动执行, 仅在触发设备安全验证
   时通过 WebUI 要求用户输入短信验证码
 - 无账号配置时, token 失效走授权链接模式 (浏览器授权后粘贴回跳 URL)
@@ -307,7 +307,7 @@ def main(argv=None):
     webui = None
     if not _env("WEBUI_DISABLE", ""):
         webui = WebUI(
-            port=int(_env("WEBUI_PORT", "8080")),
+            port=int(_env("WEBUI_PORT", "8571")),
             token=_env("WEBUI_TOKEN", ""),
         )
         webui.update(sync_interval=f"{int(_env('SYNC_INTERVAL_SECONDS', '21600'))} 秒")
