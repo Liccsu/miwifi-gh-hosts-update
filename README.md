@@ -8,7 +8,7 @@
 
 小米路由器新版固件（如 `xiaomi.router.rd15`）的"自定义 Hosts"功能没有本地接口，
 页面托管在 `s.miwifi.com`，数据通过小米云服务 `gorouter.info` 转发写入路由器。
-本程序逆向自该前端代码（`router_request_3.js` / `userhosts/index.js`），直接调用云接口：
+本程序依据该页面的网络行为，直接调用以下云接口：
 
 - 读取：`GET https://www.gorouter.info/api-third-party/service/internal/custom_host_get`
 - 写入：`POST https://www.gorouter.info/api-third-party/service/internal/custom_host_set`
@@ -45,16 +45,15 @@ token 缺失或失效时，程序输出授权链接并进入等待状态，WebUI
 > 若不想用 WebUI：授权后把回跳 URL 写入宿主机挂载目录
 > `./data/authorize.url` 同样有效。
 
-### 方式二：账号自动刷新（仅限已信任设备，受小米安全策略限制）
+### 方式二（推荐）：账号自动刷新（验证码续期）
 
-在 `.env` 中配置 `MIWIFI_XIAOMI_USER` 与 `MIWIFI_XIAOMI_PASS`，程序启动时
-尝试自动登录：密码校验 -> 发送短信验证码 -> WebUI 输入验证码 -> 换取
-`access_token` 并缓存。
+在 `.env` 中配置 `MIWIFI_XIAOMI_USER` 与 `MIWIFI_XIAOMI_PASS`，token 到期或
+失效时，程序自动执行：密码校验 -> 发送短信验证码 -> WebUI 输入验证码 ->
+完成登录态 -> 自动获取新 `access_token` 并缓存。全程仅需输入一次验证码。
 
-> 限制：小米对新设备/异地环境登录强制安全验证，且验证后的登录态完成
-> 需要页面端签名（`_signature`），程序无法复现时自动降级到方式一的
-> WebUI 授权链接。在已验证设备/网络（如家庭 NAS）上运行成功率更高。
-> 频繁触发验证码会触发风控（用户行为被限制），需等待恢复。
+> 限制：小米对异地/新设备登录强制安全验证；每日验证码发送有配额，
+> 频繁触发会临时风控（发送失败）。超限时程序自动降级到方式一的
+> WebUI 授权链接，不影响 hosts 同步。
 
 ### 方式三：手动 token
 
